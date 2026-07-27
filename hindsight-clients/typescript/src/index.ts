@@ -85,6 +85,8 @@ export interface HindsightClientOptions {
    * Deno runtimes. Defaults to `hindsight-client-typescript/<version>`.
    */
   userAgent?: string;
+  /** Optional headers sent with every request. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -126,6 +128,7 @@ export class HindsightClient {
 
   constructor(options: HindsightClientOptions) {
     const headers: Record<string, string> = {
+      ...options.headers,
       "User-Agent": options.userAgent ?? DEFAULT_USER_AGENT,
     };
     if (options.apiKey) {
@@ -455,6 +458,7 @@ export class HindsightClient {
       consolidationState?: "failed" | "pending" | "done";
       state?: "valid" | "invalidated";
       documentId?: string;
+      entityId?: string;
       signal?: AbortSignal;
     }
   ): Promise<ListMemoryUnitsResponse> {
@@ -469,6 +473,7 @@ export class HindsightClient {
         consolidation_state: options?.consolidationState,
         state: options?.state,
         document_id: options?.documentId,
+        entity_id: options?.entityId,
       },
       signal: options?.signal,
     });

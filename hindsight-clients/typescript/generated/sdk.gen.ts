@@ -112,9 +112,6 @@ import type {
   GetGraphData,
   GetGraphErrors,
   GetGraphResponses,
-  GetKnowledgeBaseGraphData,
-  GetKnowledgeBaseGraphErrors,
-  GetKnowledgeBaseGraphResponses,
   GetKnowledgeBaseTreeData,
   GetKnowledgeBaseTreeErrors,
   GetKnowledgeBaseTreeResponses,
@@ -223,6 +220,9 @@ import type {
   RetryOperationData,
   RetryOperationErrors,
   RetryOperationResponses,
+  SearchKnowledgeBaseData,
+  SearchKnowledgeBaseErrors,
+  SearchKnowledgeBaseResponses,
   TestBankLlmData,
   TestBankLlmErrors,
   TestBankLlmResponses,
@@ -330,7 +330,7 @@ export const getGraph = <ThrowOnError extends boolean = false>(
 /**
  * List memory units
  *
- * List memory units with pagination and optional full-text search. Supports filtering by type. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
+ * List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).
  */
 export const listMemories = <ThrowOnError extends boolean = false>(
   options: Options<ListMemoriesData, ThrowOnError>
@@ -738,20 +738,6 @@ export const createKnowledgePage = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Knowledge-base graph (shared source memories)
- *
- * Pages as nodes, linked when their backing models share source memories. For the graph view.
- */
-export const getKnowledgeBaseGraph = <ThrowOnError extends boolean = false>(
-  options: Options<GetKnowledgeBaseGraphData, ThrowOnError>
-) =>
-  (options.client ?? client).get<
-    GetKnowledgeBaseGraphResponses,
-    GetKnowledgeBaseGraphErrors,
-    ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/graph", ...options });
-
-/**
  * Export the knowledge base as an OKF bundle
  *
  * Return a portable OKF bundle: a nested index.md, one <id>.md per page, and history logs.
@@ -764,6 +750,20 @@ export const exportKnowledgeBase = <ThrowOnError extends boolean = false>(
     ExportKnowledgeBaseErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/knowledge-base/export", ...options });
+
+/**
+ * Hybrid search over knowledge pages (BM25 + vector)
+ *
+ * Doc-level hybrid search across a bank's knowledge pages: a full-text (BM25) match and a vector-similarity match, Reciprocal-Rank-Fusion fused. No reranker — tuned for latency.
+ */
+export const searchKnowledgeBase = <ThrowOnError extends boolean = false>(
+  options: Options<SearchKnowledgeBaseData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    SearchKnowledgeBaseResponses,
+    SearchKnowledgeBaseErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/knowledge-base/search", ...options });
 
 /**
  * Get a knowledge-base page

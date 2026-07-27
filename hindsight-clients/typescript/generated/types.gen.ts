@@ -642,6 +642,18 @@ export type BankTemplateConfig = {
    * Ceiling for the adaptive function (after clamping)
    */
   recall_budget_max?: number | null;
+  /**
+   * Audit Log Enabled
+   *
+   * Enable audit logging for this bank (overrides the server default)
+   */
+  audit_log_enabled?: boolean | null;
+  /**
+   * Store Document Text
+   *
+   * Persist raw source text (documents.original_text / chunks.chunk_text). Set false to keep only derived facts.
+   */
+  store_document_text?: boolean | null;
 };
 
 /**
@@ -2136,34 +2148,6 @@ export type KnowledgePageBundleResponse = {
 };
 
 /**
- * KnowledgePageGraphResponse
- *
- * Source memories as nodes, clustered by the page they ground.
- */
-export type KnowledgePageGraphResponse = {
-  /**
-   * Nodes
-   */
-  nodes: Array<{
-    [key: string]: unknown;
-  }>;
-  /**
-   * Edges
-   */
-  edges: Array<{
-    [key: string]: unknown;
-  }>;
-  /**
-   * Total Pages
-   */
-  total_pages: number;
-  /**
-   * Total Memories
-   */
-  total_memories: number;
-};
-
-/**
  * KnowledgePageResponse
  *
  * A knowledge page rendered as an OKF document.
@@ -2211,6 +2195,54 @@ export type KnowledgePageResponse = {
    * The full OKF document: YAML frontmatter + markdown body.
    */
   markdown: string;
+};
+
+/**
+ * KnowledgePageSearchResponse
+ *
+ * Ranked knowledge-page search results (BM25 + vector, RRF-fused).
+ */
+export type KnowledgePageSearchResponse = {
+  /**
+   * Results
+   */
+  results: Array<KnowledgePageSearchResult>;
+  /**
+   * Total
+   */
+  total: number;
+};
+
+/**
+ * KnowledgePageSearchResult
+ *
+ * One hybrid-search hit: a knowledge page and its fused relevance score.
+ */
+export type KnowledgePageSearchResult = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Name
+   */
+  name: string;
+  /**
+   * Mental Model Id
+   */
+  mental_model_id?: string | null;
+  /**
+   * Snippet
+   */
+  snippet: string;
+  /**
+   * Score
+   */
+  score: number;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
 };
 
 /**
@@ -3790,6 +3822,12 @@ export type RetainRequest = {
    * @deprecated
    */
   document_tags?: Array<string> | null;
+  /**
+   * Operation Id
+   *
+   * Optional client-supplied UUID used as the identity of an async retain operation. Re-submitting with the same operation_id returns the original operation and creates no new work, so retrying after a lost or timed-out acknowledgement will not enqueue a duplicate. Reusing an id that belongs to a different operation returns HTTP 409. Ignored for synchronous retain.
+   */
+  operation_id?: string | null;
 };
 
 /**
@@ -4616,6 +4654,10 @@ export type ListMemoriesData = {
      * Document Id
      */
     document_id?: string | null;
+    /**
+     * Entity Id
+     */
+    entity_id?: string | null;
     /**
      * Tags
      */
@@ -5677,44 +5719,6 @@ export type CreateKnowledgePageResponses = {
 export type CreateKnowledgePageResponse2 =
   CreateKnowledgePageResponses[keyof CreateKnowledgePageResponses];
 
-export type GetKnowledgeBaseGraphData = {
-  body?: never;
-  headers?: {
-    /**
-     * Authorization
-     */
-    authorization?: string | null;
-  };
-  path: {
-    /**
-     * Bank Id
-     */
-    bank_id: string;
-  };
-  query?: never;
-  url: "/v1/default/banks/{bank_id}/knowledge-base/graph";
-};
-
-export type GetKnowledgeBaseGraphErrors = {
-  /**
-   * Validation Error
-   */
-  422: HttpValidationError;
-};
-
-export type GetKnowledgeBaseGraphError =
-  GetKnowledgeBaseGraphErrors[keyof GetKnowledgeBaseGraphErrors];
-
-export type GetKnowledgeBaseGraphResponses = {
-  /**
-   * Successful Response
-   */
-  200: KnowledgePageGraphResponse;
-};
-
-export type GetKnowledgeBaseGraphResponse =
-  GetKnowledgeBaseGraphResponses[keyof GetKnowledgeBaseGraphResponses];
-
 export type ExportKnowledgeBaseData = {
   body?: never;
   headers?: {
@@ -5751,6 +5755,56 @@ export type ExportKnowledgeBaseResponses = {
 
 export type ExportKnowledgeBaseResponse =
   ExportKnowledgeBaseResponses[keyof ExportKnowledgeBaseResponses];
+
+export type SearchKnowledgeBaseData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query: {
+    /**
+     * Q
+     *
+     * Search query
+     */
+    q: string;
+    /**
+     * Limit
+     *
+     * Maximum results to return
+     */
+    limit?: number;
+  };
+  url: "/v1/default/banks/{bank_id}/knowledge-base/search";
+};
+
+export type SearchKnowledgeBaseErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type SearchKnowledgeBaseError = SearchKnowledgeBaseErrors[keyof SearchKnowledgeBaseErrors];
+
+export type SearchKnowledgeBaseResponses = {
+  /**
+   * Successful Response
+   */
+  200: KnowledgePageSearchResponse;
+};
+
+export type SearchKnowledgeBaseResponse =
+  SearchKnowledgeBaseResponses[keyof SearchKnowledgeBaseResponses];
 
 export type GetKnowledgePageData = {
   body?: never;

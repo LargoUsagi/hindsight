@@ -244,7 +244,7 @@
           "Memory"
         ],
         "summary": "List memory units",
-        "description": "List memory units with pagination and optional full-text search. Supports filtering by type. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).",
+        "description": "List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).",
         "operationId": "list_memories",
         "parameters": [
           {
@@ -334,6 +334,22 @@
                 }
               ],
               "title": "Document Id"
+            }
+          },
+          {
+            "name": "entity_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Entity Id"
             }
           },
           {
@@ -2243,65 +2259,6 @@
         }
       }
     },
-    "/v1/default/banks/{bank_id}/knowledge-base/graph": {
-      "get": {
-        "tags": [
-          "Knowledge Base"
-        ],
-        "summary": "Knowledge-base graph (shared source memories)",
-        "description": "Pages as nodes, linked when their backing models share source memories. For the graph view.",
-        "operationId": "get_knowledge_base_graph",
-        "parameters": [
-          {
-            "name": "bank_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Bank Id"
-            }
-          },
-          {
-            "name": "authorization",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/KnowledgePageGraphResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/default/banks/{bank_id}/knowledge-base/export": {
       "get": {
         "tags": [
@@ -2344,6 +2301,91 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/KnowledgePageBundleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/default/banks/{bank_id}/knowledge-base/search": {
+      "get": {
+        "tags": [
+          "Knowledge Base"
+        ],
+        "summary": "Hybrid search over knowledge pages (BM25 + vector)",
+        "description": "Doc-level hybrid search across a bank's knowledge pages: a full-text (BM25) match and a vector-similarity match, Reciprocal-Rank-Fusion fused. No reranker \u2014 tuned for latency.",
+        "operationId": "search_knowledge_base",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Search query",
+              "title": "Q"
+            },
+            "description": "Search query"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Maximum results to return",
+              "default": 10,
+              "title": "Limit"
+            },
+            "description": "Maximum results to return"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KnowledgePageSearchResponse"
                 }
               }
             }
@@ -7601,6 +7643,30 @@
             ],
             "title": "Recall Budget Max",
             "description": "Ceiling for the adaptive function (after clamping)"
+          },
+          "audit_log_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audit Log Enabled",
+            "description": "Enable audit logging for this bank (overrides the server default)"
+          },
+          "store_document_text": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Store Document Text",
+            "description": "Persist raw source text (documents.original_text / chunks.chunk_text). Set false to keep only derived facts."
           }
         },
         "type": "object",
@@ -9987,43 +10053,6 @@
         "title": "KnowledgePageBundleResponse",
         "description": "A portable OKF bundle \u2014 a flat set of markdown files (index + pages + logs)."
       },
-      "KnowledgePageGraphResponse": {
-        "properties": {
-          "nodes": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "type": "array",
-            "title": "Nodes"
-          },
-          "edges": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "type": "array",
-            "title": "Edges"
-          },
-          "total_pages": {
-            "type": "integer",
-            "title": "Total Pages"
-          },
-          "total_memories": {
-            "type": "integer",
-            "title": "Total Memories"
-          }
-        },
-        "type": "object",
-        "required": [
-          "nodes",
-          "edges",
-          "total_pages",
-          "total_memories"
-        ],
-        "title": "KnowledgePageGraphResponse",
-        "description": "Source memories as nodes, clustered by the page they ground."
-      },
       "KnowledgePageResponse": {
         "properties": {
           "id": {
@@ -10098,6 +10127,79 @@
         ],
         "title": "KnowledgePageResponse",
         "description": "A knowledge page rendered as an OKF document."
+      },
+      "KnowledgePageSearchResponse": {
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/KnowledgePageSearchResult"
+            },
+            "type": "array",
+            "title": "Results"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "results",
+          "total"
+        ],
+        "title": "KnowledgePageSearchResponse",
+        "description": "Ranked knowledge-page search results (BM25 + vector, RRF-fused)."
+      },
+      "KnowledgePageSearchResult": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "mental_model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mental Model Id"
+          },
+          "snippet": {
+            "type": "string",
+            "title": "Snippet"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "snippet",
+          "score"
+        ],
+        "title": "KnowledgePageSearchResult",
+        "description": "One hybrid-search hit: a knowledge page and its fused relevance score."
       },
       "KnowledgeTreeResponse": {
         "properties": {
@@ -13107,6 +13209,18 @@
             "title": "Document Tags",
             "description": "Deprecated. Use item-level tags instead.",
             "deprecated": true
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id",
+            "description": "Optional client-supplied UUID used as the identity of an async retain operation. Re-submitting with the same operation_id returns the original operation and creates no new work, so retrying after a lost or timed-out acknowledgement will not enqueue a duplicate. Reusing an id that belongs to a different operation returns HTTP 409. Ignored for synchronous retain."
           }
         },
         "type": "object",

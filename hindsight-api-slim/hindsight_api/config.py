@@ -429,6 +429,9 @@ ENV_RERANKER_LITELLM_SDK_TIMEOUT = "HINDSIGHT_API_RERANKER_LITELLM_SDK_TIMEOUT"
 ENV_RERANKER_GOOGLE_TIMEOUT = "HINDSIGHT_API_RERANKER_GOOGLE_TIMEOUT"
 ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
 ENV_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY"
+ENV_GRAPH_SEED_MIN_SIMILARITY = "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY"
+ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"
+ENV_SEMANTIC_LINK_MIN_SIMILARITY = "HINDSIGHT_API_SEMANTIC_LINK_MIN_SIMILARITY"
 ENV_RERANKER_FLASHRANK_MODEL = "HINDSIGHT_API_RERANKER_FLASHRANK_MODEL"
 ENV_RERANKER_FLASHRANK_CACHE_DIR = "HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR"
 ENV_RERANKER_FLASHRANK_CPU_MEM_ARENA = "HINDSIGHT_API_RERANKER_FLASHRANK_CPU_MEM_ARENA"
@@ -492,6 +495,12 @@ ENV_OTEL_SERVICE_NAME = "HINDSIGHT_API_OTEL_SERVICE_NAME"
 ENV_OTEL_DEPLOYMENT_ENVIRONMENT = "HINDSIGHT_API_OTEL_DEPLOYMENT_ENVIRONMENT"
 ENV_METRICS_INCLUDE_BANK_ID = "HINDSIGHT_API_METRICS_INCLUDE_BANK_ID"
 ENV_METRICS_BACKLOG_ENABLED = "HINDSIGHT_API_METRICS_BACKLOG_ENABLED"
+
+# Runtime-stall observability (loop watchdog + DB pool acquire instrumentation)
+ENV_LOOP_WATCHDOG_ENABLED = "HINDSIGHT_API_LOOP_WATCHDOG_ENABLED"
+ENV_LOOP_WATCHDOG_STALL_THRESHOLD_MS = "HINDSIGHT_API_LOOP_WATCHDOG_STALL_THRESHOLD_MS"
+ENV_LOOP_WATCHDOG_POLL_INTERVAL_MS = "HINDSIGHT_API_LOOP_WATCHDOG_POLL_INTERVAL_MS"
+ENV_DB_ACQUIRE_WARN_THRESHOLD_MS = "HINDSIGHT_API_DB_ACQUIRE_WARN_THRESHOLD_MS"
 
 # Vertex AI configuration
 ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
@@ -828,6 +837,9 @@ DEFAULT_RERANKER_LITELLM_SDK_TIMEOUT = 60.0
 DEFAULT_RERANKER_GOOGLE_TIMEOUT = 60.0
 DEFAULT_RERANKER_MAX_CANDIDATES = 300
 DEFAULT_SEMANTIC_MIN_SIMILARITY = 0.3
+DEFAULT_GRAPH_SEED_MIN_SIMILARITY = 0.3
+DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1
+DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY = 0.7
 # Minimum BM25 score a row must exceed to enter fusion. 0.0 gates out
 # zero-score (non-matching) rows on backends — notably VectorChord — whose
 # operator ranks every document rather than pre-filtering to term matches.
@@ -1157,6 +1169,16 @@ DEFAULT_OTEL_SERVICE_NAME = "hindsight-api"
 DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT = "development"
 DEFAULT_METRICS_INCLUDE_BANK_ID = False  # Disabled by default to avoid high-cardinality OTel metric growth
 DEFAULT_METRICS_BACKLOG_ENABLED = False  # Disabled by default: runs periodic per-schema COUNT queries
+
+# Runtime-stall observability defaults. Both are cheap and on by default: the
+# watchdog is a single background thread pinging the loop; the DB-pool acquire
+# timing is a monotonic() delta per acquire. They turn a failing liveness probe
+# from "pod restarted, cause unknown" into a logged root cause (blocked loop vs
+# pool exhaustion).
+DEFAULT_LOOP_WATCHDOG_ENABLED = True
+DEFAULT_LOOP_WATCHDOG_STALL_THRESHOLD_MS = 1000  # log a stall once the loop is unresponsive this long
+DEFAULT_LOOP_WATCHDOG_POLL_INTERVAL_MS = 250  # how often the watchdog thread pings the loop
+DEFAULT_DB_ACQUIRE_WARN_THRESHOLD_MS = 1000  # log a warning when a pool acquire waits this long
 
 # Audit log defaults
 DEFAULT_AUDIT_LOG_ENABLED = False  # Disabled by default
@@ -1830,6 +1852,9 @@ class HindsightConfig:
     reranker_tei_http_timeout: float
     reranker_max_candidates: int
     semantic_min_similarity: float
+    graph_seed_min_similarity: float
+    temporal_semantic_min_similarity: float
+    semantic_link_min_similarity: float
     bm25_min_score: float
     recall_max_candidates_per_source: int
     recall_strategy_boosts: dict[str, str]
@@ -2049,6 +2074,12 @@ class HindsightConfig:
     metrics_include_bank_id: bool
     metrics_backlog_enabled: bool
 
+    # Runtime-stall observability (static, server-level only)
+    loop_watchdog_enabled: bool
+    loop_watchdog_stall_threshold_ms: int
+    loop_watchdog_poll_interval_ms: int
+    db_acquire_warn_threshold_ms: int
+
     # Audit log configuration
     # audit_log_enabled is hierarchical (env -> tenant -> bank): a deployment can
     # audit some banks and not others. The actions allowlist and retention window
@@ -2173,6 +2204,10 @@ class HindsightConfig:
         # Audit logging on/off, per bank. The actions allowlist and retention
         # window remain server-level and are deliberately not configurable.
         "audit_log_enabled",
+        # Persist raw source text (documents.original_text / chunks.chunk_text).
+        # Per-bank so a data-minimizing bank can keep only derived facts while
+        # others retain the raw source for expansion/re-extraction.
+        "store_document_text",
         # Retention settings (behavioral)
         "retain_chunk_size",
         "retain_structured_chunk_size",
@@ -2311,10 +2346,15 @@ class HindsightConfig:
             self.text_search_extension_pg_search_tokenizer
         )
 
-        if not 0.0 <= self.semantic_min_similarity <= 1.0:
-            raise ValueError(
-                f"Invalid semantic_min_similarity: {self.semantic_min_similarity}. Must be between 0.0 and 1.0"
-            )
+        for field_name in (
+            "semantic_min_similarity",
+            "graph_seed_min_similarity",
+            "temporal_semantic_min_similarity",
+            "semantic_link_min_similarity",
+        ):
+            value = getattr(self, field_name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"Invalid {field_name}: {value}. Must be between 0.0 and 1.0")
 
         if self.bm25_max_query_terms < 0:
             raise ValueError(f"Invalid bm25_max_query_terms: {self.bm25_max_query_terms}. Must be >= 0")
@@ -2771,6 +2811,15 @@ class HindsightConfig:
             ),
             reranker_max_candidates=int(os.getenv(ENV_RERANKER_MAX_CANDIDATES, str(DEFAULT_RERANKER_MAX_CANDIDATES))),
             semantic_min_similarity=float(os.getenv(ENV_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_SEMANTIC_MIN_SIMILARITY))),
+            graph_seed_min_similarity=float(
+                os.getenv(ENV_GRAPH_SEED_MIN_SIMILARITY, str(DEFAULT_GRAPH_SEED_MIN_SIMILARITY))
+            ),
+            temporal_semantic_min_similarity=float(
+                os.getenv(ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY))
+            ),
+            semantic_link_min_similarity=float(
+                os.getenv(ENV_SEMANTIC_LINK_MIN_SIMILARITY, str(DEFAULT_SEMANTIC_LINK_MIN_SIMILARITY))
+            ),
             bm25_min_score=float(os.getenv(ENV_BM25_MIN_SCORE, str(DEFAULT_BM25_MIN_SCORE))),
             bm25_max_query_terms=_parse_non_negative_int(
                 ENV_BM25_MAX_QUERY_TERMS,
@@ -3168,6 +3217,18 @@ class HindsightConfig:
             in ("true", "1", "yes"),
             metrics_backlog_enabled=os.getenv(ENV_METRICS_BACKLOG_ENABLED, str(DEFAULT_METRICS_BACKLOG_ENABLED)).lower()
             in ("true", "1", "yes"),
+            # Runtime-stall observability (static, server-level only)
+            loop_watchdog_enabled=os.getenv(ENV_LOOP_WATCHDOG_ENABLED, str(DEFAULT_LOOP_WATCHDOG_ENABLED)).lower()
+            in ("true", "1", "yes"),
+            loop_watchdog_stall_threshold_ms=int(
+                os.getenv(ENV_LOOP_WATCHDOG_STALL_THRESHOLD_MS, str(DEFAULT_LOOP_WATCHDOG_STALL_THRESHOLD_MS))
+            ),
+            loop_watchdog_poll_interval_ms=int(
+                os.getenv(ENV_LOOP_WATCHDOG_POLL_INTERVAL_MS, str(DEFAULT_LOOP_WATCHDOG_POLL_INTERVAL_MS))
+            ),
+            db_acquire_warn_threshold_ms=int(
+                os.getenv(ENV_DB_ACQUIRE_WARN_THRESHOLD_MS, str(DEFAULT_DB_ACQUIRE_WARN_THRESHOLD_MS))
+            ),
             # Audit log configuration (static, server-level only)
             audit_log_enabled=os.getenv(ENV_AUDIT_LOG_ENABLED, str(DEFAULT_AUDIT_LOG_ENABLED)).lower() == "true",
             audit_log_actions=[

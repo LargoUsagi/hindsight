@@ -247,6 +247,7 @@ async def _dedup_reconcile_create(
     create_text: str,
     create_source_ids: list[uuid.UUID],
     tags: list[str] | None,
+    txn=None,
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
 
@@ -285,7 +286,7 @@ async def _dedup_reconcile_create(
         )
     else:
         await _reconcile_merge_via_store(
-            store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, create_source_ids
+            store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, create_source_ids, txn=txn
         )
     return outcome.best_id
 
@@ -300,6 +301,7 @@ async def _dedup_reconcile_update(
     updated_text: str,
     updated_emb_str: str | None,
     tags: list[str] | None,
+    txn=None,
 ) -> None:
     """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
 
@@ -358,9 +360,9 @@ async def _dedup_reconcile_update(
         updated_obs = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id])
         updated_sources = list(updated_obs[0].source_memory_ids or []) if updated_obs else []
         await _reconcile_merge_via_store(
-            store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, updated_sources
+            store, conn, memory_engine, bank_id, outcome.best_id, outcome.merged_text, updated_sources, txn=txn
         )
-    await _execute_delete_action(conn, bank_id, updated_id)
+    await _execute_delete_action(conn, bank_id, updated_id, txn=txn)
     logger.info(
         "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
         updated_id[:8],
@@ -816,6 +818,7 @@ async def _reconcile_merge_via_store(
     observation_id: str,
     merged_text: str,
     add_source_ids: list,
+    txn=None,
 ) -> None:
     """Dedup merge for a store that owns its rows: fold the extra source facts and the merged text
     into the twin observation and re-upsert it, preserving its other fields. Re-embeds the merged
@@ -830,6 +833,7 @@ async def _reconcile_merge_via_store(
     await store.upsert_observation(
         conn=conn,
         bank_id=bank_id,
+        txn=txn,
         record=FactRecord(
             unit_id=observation_id,
             text=merged_text,
@@ -1131,6 +1135,14 @@ async def _run_consolidation_job(
             succeeded_ids: list[Any] = []
             failed_ids: list[Any] = []
 
+            # One cross-store write-group per LLM batch: MINT the txn up front (no Postgres held)
+            # and tag every observation upsert/delete + the mark_consolidated stamps with it, so
+            # they are durable-but-invisible in memlake while this batch runs its LLM work. The
+            # witness row + decide happen in ONE short transaction at the end (below) — we must not
+            # hold a Postgres transaction across the LLM calls in the sub-batch loop.
+            _txn_provider = get_memories()
+            _batch_txn = await _txn_provider.mint_txn(bank_id=bank_id, mutating=True)
+
             pending: list[list[dict[str, Any]]] = [llm_batch_local]
             while pending:
                 sub_batch = pending.pop(0)
@@ -1153,6 +1165,7 @@ async def _run_consolidation_job(
                                 perf=batch_perf,
                                 config=config,
                                 obs_tags_override=obs_tags,
+                                txn=_batch_txn,
                             )
                             sub_deleted += pass_deleted
                             sub_llm_failed = sub_llm_failed or pass_failed
@@ -1189,6 +1202,7 @@ async def _run_consolidation_job(
                             request_context=request_context,
                             perf=batch_perf,
                             config=config,
+                            txn=_batch_txn,
                         )
 
                 all_deleted += sub_deleted
@@ -1211,7 +1225,10 @@ async def _run_consolidation_job(
                     succeeded_ids.extend(m["id"] for m in sub_batch)
                     all_results.extend(sub_results)
 
-            # Mark through the store so the flag lands wherever the source facts live.
+            # Mark through the store so the flag lands wherever the source facts live — tagged
+            # with this batch's txn, so the marks become visible together with the observations
+            # above. Then record the witness row and commit in this ONE short transaction (no LLM
+            # work inside it): its commit is the batch's fate, and `decide` publishes the group.
             async with acquire_with_retry(pool) as conn:
                 store = get_memories()
                 now = datetime.now(timezone.utc)
@@ -1223,6 +1240,7 @@ async def _run_consolidation_job(
                         unit_ids=[str(mem_id) for mem_id in succeeded_ids],
                         when=now,
                         failed=False,
+                        txn=_batch_txn,
                     )
                 if failed_ids:
                     await store.mark_consolidated(
@@ -1232,7 +1250,13 @@ async def _run_consolidation_job(
                         unit_ids=[str(mem_id) for mem_id in failed_ids],
                         when=now,
                         failed=True,
+                        txn=_batch_txn,
                     )
+                async with conn.transaction():
+                    await _txn_provider.write_txn_witness(_batch_txn, conn=conn, fq_table=fq_table)
+            # Postgres committed the witness: publish the batch's write-group. On a crash before
+            # here the writes stay invisible and the recovery sweep resolves them (spec §5).
+            await _txn_provider.decide_txn(_batch_txn, commit=True)
 
             cancelled_local = False
             if operation_id and not await memory_engine._check_op_alive(operation_id):
@@ -1607,6 +1631,7 @@ async def _process_memory_batch(
     perf: ConsolidationPerfLog | None = None,
     config: Any = None,
     obs_tags_override: list[str] | None = None,
+    txn=None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """
     Process a batch of memories in a single LLM call.
@@ -1739,7 +1764,7 @@ async def _process_memory_batch(
                 f"Batch consolidation: rejected delete — observation {delete.observation_id} not in unioned recall"
             )
             continue
-        await _execute_delete_action(conn=conn, bank_id=bank_id, observation_id=delete.observation_id)
+        await _execute_delete_action(conn=conn, bank_id=bank_id, observation_id=delete.observation_id, txn=txn)
         deleted_count += 1
 
     for update in llm_result.updates:
@@ -1767,6 +1792,7 @@ async def _process_memory_batch(
             source_occurred_end=agg.occurred_end,
             source_mentioned_at=agg.mentioned_at,
             perf=perf,
+            txn=txn,
         )
         for m in source_mems:
             per_memory_updated.add(str(m["id"]))
@@ -1784,6 +1810,7 @@ async def _process_memory_batch(
                 update.text,
                 updated_emb_str,
                 agg.tags,
+                txn=txn,
             )
 
     # Deterministic dedup guard: map the observations the LLM was SHOWN by their
@@ -1823,7 +1850,8 @@ async def _process_memory_batch(
         # near-identical observation (LLM-adjudicated, 1-by-1) instead of inserting a dup.
         if dedup_enabled:
             merged_into = await _dedup_reconcile_create(
-                conn, memory_engine, bank_id, config, dedup_llm_config, create.text, create_source_ids, agg.tags
+                conn, memory_engine, bank_id, config, dedup_llm_config, create.text, create_source_ids, agg.tags,
+                txn=txn,
             )
             if merged_into is not None:
                 logger.info(
@@ -1847,6 +1875,7 @@ async def _process_memory_batch(
             occurred_end=agg.occurred_end,
             mentioned_at=agg.mentioned_at,
             perf=perf,
+            txn=txn,
         )
         for m in source_mems:
             per_memory_created.add(str(m["id"]))
@@ -1957,6 +1986,7 @@ async def _execute_update_action(
     source_occurred_end: datetime | None = None,
     source_mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
+    txn=None,
 ) -> str | None:
     """
     Update an existing observation.
@@ -2049,6 +2079,7 @@ async def _execute_update_action(
         await store.upsert_observation(
             conn=conn,
             bank_id=bank_id,
+            txn=txn,
             record=FactRecord(
                 unit_id=observation_id,
                 text=new_text,
@@ -2112,6 +2143,7 @@ async def _execute_create_action(
     occurred_end: datetime | None = None,
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
+    txn=None,
 ) -> None:
     """
     Create a new observation from one or more source memories.
@@ -2131,6 +2163,7 @@ async def _execute_create_action(
         occurred_end=occurred_end,
         mentioned_at=mentioned_at,
         perf=perf,
+        txn=txn,
     )
     # Map the new observation onto the consolidation trace as a produced memory.
     new_id = created.get("observation_id")
@@ -2143,6 +2176,7 @@ async def _execute_delete_action(
     conn: "Connection",
     bank_id: str,
     observation_id: str,
+    txn=None,
 ) -> None:
     """Delete a superseded or contradicted observation."""
     store = get_memories()
@@ -2153,7 +2187,7 @@ async def _execute_delete_action(
             bank_id,
         )
     else:
-        await store.delete_facts(bank_id, [observation_id])
+        await store.delete_facts(bank_id, [observation_id], txn=txn)
     logger.debug(f"Deleted observation {observation_id}")
 
 
@@ -2497,6 +2531,7 @@ async def _create_observation_directly(
     occurred_end: datetime | None = None,
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
+    txn=None,
 ) -> dict[str, Any]:
     """Create an observation from one or more source memories with pre-processed text."""
     live_source_memory_ids = await _filter_live_source_memories(conn, bank_id, source_memory_ids)
@@ -2592,6 +2627,7 @@ async def _create_observation_directly(
         await store.upsert_observation(
             conn=conn,
             bank_id=bank_id,
+            txn=txn,
             record=FactRecord(
                 unit_id=str(observation_id),
                 text=observation_text,

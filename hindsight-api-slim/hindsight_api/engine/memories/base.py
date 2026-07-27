@@ -46,6 +46,20 @@ from ...extensions.base import Extension
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..search.retrieval import GraphRetriever
 
+
+class MemoryTxn:
+    """Opaque token for a cross-store write-group transaction, threaded from
+    :meth:`MemoriesExtension.begin_txn` through the write calls to
+    :meth:`MemoriesExtension.decide_txn`.
+
+    A store that keeps memories in the same database as the caller's transaction has nothing
+    to coordinate and returns ``None`` from ``begin_txn`` — the write methods then receive
+    ``txn=None`` and behave exactly as before. A store that writes memories to a *separate*
+    system (memlake) subclasses this to carry whatever it needs to defer the writes'
+    visibility until the caller's transaction is known to have committed. The base is
+    deliberately empty: only the store that minted a handle interprets it."""
+
+
 # Hindsight's fact_type strings <-> a numeric memory type. An implementation that
 # indexes per type (results are never fused across types) lines up exactly with
 # how recall queries one arm set per fact_type.
@@ -400,6 +414,43 @@ class MemoriesExtension(Extension, ABC):
 
     # ------------------------------------------------------------------ writes
 
+    async def begin_txn(self, *, conn, fq_table, bank_id: str, mutating: bool) -> "MemoryTxn | None":
+        """Open a cross-store write-group transaction around a unit of work, or ``None``.
+
+        Called INSIDE the caller's database transaction, before the writes that belong to it.
+        The returned handle is threaded (as ``txn=``) into every write of the unit and finally
+        into :meth:`decide_txn` once the caller's transaction has settled.
+
+        Default is ``None``: a store whose memories live in the caller's own database needs no
+        cross-store coordination — its writes are already covered by that transaction, and the
+        ``txn`` kwarg is ignored everywhere. A store that writes to a *separate* system returns
+        a handle so those writes can be held invisible until the transaction is known to have
+        committed. ``mutating`` distinguishes a unit that only creates new memories (safe to
+        write plainly and compensate on abort) from one that changes or removes existing ones
+        (whose previous value only deferred visibility can preserve)."""
+        return None
+
+    async def decide_txn(self, txn: "MemoryTxn | None", *, commit: bool) -> None:
+        """Resolve a handle from :meth:`begin_txn` after its transaction settled.
+
+        ``commit=True`` once the caller's transaction has COMMITTED, ``commit=False`` if it
+        aborted. A no-op for ``None``. For a separate-store implementation this is where the
+        held writes are made visible (commit) or discarded/compensated (abort)."""
+        return None
+
+    async def mint_txn(self, *, bank_id: str, mutating: bool) -> "MemoryTxn | None":
+        """Mint a write-group handle WITHOUT opening a database transaction — the split form of
+        :meth:`begin_txn` for a unit of work (consolidation) that runs slow work between its
+        writes and must not hold a transaction across it. Tag the writes with the handle, then
+        :meth:`write_txn_witness` + commit in one short transaction at the end, then
+        :meth:`decide_txn`. Default ``None`` (no cross-store coordination)."""
+        return None
+
+    async def write_txn_witness(self, txn: "MemoryTxn | None", *, conn, fq_table) -> None:
+        """Record a :meth:`mint_txn` handle's commit witness in the caller's transaction, just
+        before it commits. No-op for ``None``."""
+        return None
+
     @abstractmethod
     async def insert_facts(
         self,
@@ -410,6 +461,7 @@ class MemoriesExtension(Extension, ABC):
         facts: list,
         document_id: str | None = None,
         defer_index: bool = False,
+        txn: "MemoryTxn | None" = None,
     ) -> list[str]:
         """Store a batch of extracted facts and return their unit ids, in order.
 
@@ -439,7 +491,7 @@ class MemoriesExtension(Extension, ABC):
         """
 
     @abstractmethod
-    async def delete_facts(self, bank_id: str, unit_ids: list[str]) -> None:
+    async def delete_facts(self, bank_id: str, unit_ids: list[str], *, txn: "MemoryTxn | None" = None) -> None:
         """Remove units. Safe to call for ids that were never written."""
 
     async def delete_where(self, bank_id: str, predicate: DeletePredicate) -> int:
@@ -451,7 +503,9 @@ class MemoriesExtension(Extension, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def delete_document(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
+    async def delete_document(
+        self, *, conn, fq_table, bank_id: str, document_id: str, txn: "MemoryTxn | None" = None
+    ) -> None:
         """Remove every memory belonging to ``document_id``.
 
         Called when a document is replaced, so it races the replacement's writes:
@@ -624,6 +678,7 @@ class MemoriesExtension(Extension, ABC):
         unit_ids: list[str],
         when: datetime | None,
         failed: bool = False,
+        txn: "MemoryTxn | None" = None,
     ) -> None:
         """Stamp (or clear, with ``when=None``) the consolidated marker on sources.
 
@@ -896,7 +951,7 @@ class MemoriesExtension(Extension, ABC):
 
     # ------------------------------------------------------------------ observations
 
-    async def upsert_observation(self, *, conn, bank_id: str, record: FactRecord) -> None:
+    async def upsert_observation(self, *, conn, bank_id: str, record: FactRecord, txn: "MemoryTxn | None" = None) -> None:
         """Write an observation, replacing any earlier one with the same id."""
         raise NotImplementedError
 
@@ -978,6 +1033,7 @@ __all__ = [
     "FactRecord",
     "MemoriesExtension",
     "MemoryPatch",
+    "MemoryTxn",
     "ScanPage",
     "StoredMemory",
     "build_fact_records",

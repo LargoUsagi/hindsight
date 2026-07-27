@@ -43,19 +43,23 @@ class PostgresMemories(MemoriesExtension):
         facts: list,
         document_id: str | None = None,
         defer_index: bool = False,
+        txn=None,
     ) -> list[str]:
+        # `txn` is ignored: Postgres memories live in the caller's own transaction, so the
+        # write is already atomic with it — there is no separate store to hold invisible.
         # `defer_index` is meaningless here: the INSERT that returns the ids is
         # also what indexes the facts, so there is nothing to defer.
         return await writes.insert_facts(conn=conn, ops=ops, bank_id=bank_id, facts=facts, document_id=document_id)
 
-    async def delete_facts(self, bank_id: str, unit_ids: list[str]) -> None:
+    async def delete_facts(self, bank_id: str, unit_ids: list[str], *, txn=None) -> None:
         """No-op: the caller's `memory_units` DELETE (or its FK cascade) removed them."""
 
     async def delete_where(self, bank_id: str, predicate: DeletePredicate) -> int:
         """No-op: predicate deletes are issued as SQL by the caller that owns the transaction."""
         return 0
 
-    async def delete_document(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
+    async def delete_document(self, *, conn, fq_table, bank_id: str, document_id: str, txn=None) -> None:
+        # `txn` ignored: Postgres memories are covered by the caller's own transaction.
         await writes.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
 
     async def delete_namespace(self, bank_id: str) -> None:
@@ -213,6 +217,7 @@ class PostgresMemories(MemoriesExtension):
         unit_ids: list[str],
         when: datetime | None,
         failed: bool = False,
+        txn=None,
     ) -> None:
         await reads.mark_consolidated(
             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids, when=when, failed=failed
@@ -266,7 +271,7 @@ class PostgresMemories(MemoriesExtension):
 
     # ------------------------------------------------------------------ observations
 
-    async def upsert_observation(self, *, conn, bank_id: str, record) -> None:
+    async def upsert_observation(self, *, conn, bank_id: str, record, txn=None) -> None:
         """No-op: the observation was written as a `memory_units` row by the caller."""
 
     async def observations_for_sources(

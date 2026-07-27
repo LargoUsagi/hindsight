@@ -47,6 +47,7 @@ async def insert_facts_batch(
     document_id: str | None = None,
     ops=None,
     defer_index: bool = False,
+    txn=None,
 ) -> list[str]:
     """
     Store facts and return their unit ids, in order.
@@ -77,6 +78,7 @@ async def insert_facts_batch(
         facts=facts,
         document_id=document_id,
         defer_index=defer_index,
+        txn=txn,
     )
 
 
@@ -179,6 +181,7 @@ async def handle_document_tracking(
     retain_params: dict | None = None,
     document_tags: list[str] | None = None,
     ops=None,
+    txn=None,
 ) -> None:
     """
     Handle document tracking in the database (full-replace mode).
@@ -260,7 +263,7 @@ async def handle_document_tracking(
         # catches units that have a non-NULL chunk_id FK. Units with chunk_id=NULL
         # (e.g. from partial writes or edge cases) would survive the cascade.
         # This explicit delete ensures complete cleanup.
-        await store.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
+        await store.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, txn=txn)
         # Capture created_at before deletion so re-ingestion preserves it.
         preserved_created_at = await conn.fetchval(
             f"DELETE FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2 RETURNING created_at",

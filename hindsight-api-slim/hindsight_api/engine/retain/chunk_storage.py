@@ -55,12 +55,17 @@ async def load_existing_chunks(conn, bank_id: str, document_id: str) -> list[Exi
     ]
 
 
-async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str | None = None) -> None:
+async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str | None = None, txn=None) -> None:
     """
     Delete specific chunks by their IDs.
 
     This cascades to memory_units (via FK with CASCADE delete)
     and their links.
+
+    ``txn`` carries a cross-store write-group handle when this delete is part of a re-ingest:
+    the store's tombstones must ride the same txn as the replacement writes so they commit
+    (become visible) together — otherwise an aborted re-ingest could drop the old memories
+    without landing the new ones.
     """
     if not chunk_ids:
         return
@@ -73,7 +78,7 @@ async def delete_chunks_by_ids(conn, chunk_ids: list[str], bank_id: str | None =
     _store = get_memories()
     if bank_id and not _store.writes_memory_rows_in_sql:
         for _cid in chunk_ids:
-            await _store.delete_where(bank_id, DeletePredicate(metadata_equals={META_CHUNK_ID: _cid}))
+            await _store.delete_where(bank_id, DeletePredicate(metadata_equals={META_CHUNK_ID: _cid}), txn=txn)
 
     # PostgreSQL's FK cascade deletes child memory_links in executor-chosen
     # order. Concurrent chunk deletes for the same bank can then lock overlapping

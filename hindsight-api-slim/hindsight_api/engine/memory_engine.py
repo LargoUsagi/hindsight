@@ -5926,6 +5926,7 @@ class MemoryEngine(MemoryEngineInterface):
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         backend = await self._get_backend()
         invalidated_obs = 0
+        _del_txn = None
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
                 # Get memory unit IDs before deletion (for observation cleanup). A store that
@@ -5977,9 +5978,16 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
                 # For a store that keeps memories outside SQL, deleting the documents row does not
-                # cascade to its memories (they are not SQL rows) — drop them through the store.
+                # cascade to its memories (they are not SQL rows) — drop them through the store,
+                # tagged with a write-group so the store tombstone commits atomically with the
+                # Postgres document delete (a rolled-back delete must not orphan the memories).
                 if deleted and not _store.writes_memory_rows_in_sql:
-                    await _store.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
+                    _del_txn = await _store.begin_txn(
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, mutating=True
+                    )
+                    await _store.delete_document(
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, txn=_del_txn
+                    )
 
                 # Invalidate observations referencing these (now-deleted) memories
                 if unit_ids:
@@ -5989,6 +5997,11 @@ class MemoryEngine(MemoryEngineInterface):
                     "document_deleted": 1 if deleted else 0,
                     "memory_units_deleted": units_count if deleted else 0,
                 }
+
+        # Postgres committed the delete: publish the store's tombstone write-group (no-op if
+        # nothing was deleted or the store keeps memories in SQL).
+        if _del_txn is not None:
+            await _store.decide_txn(_del_txn, commit=True)
 
         # Drop any cached stats for this bank — deleting the document changed
         # the document count and (via cascade) the memory-unit/link counts
@@ -6249,6 +6262,7 @@ class MemoryEngine(MemoryEngineInterface):
         invalidated_obs = 0
         bank_id_for_consolidation: str | None = None
         bank_id_for_graph_maintenance: str | None = None
+        _del_txn = None
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
                 # Get bank_id and fact_type before deletion. A SQL store discovers the bank from
@@ -6293,7 +6307,11 @@ class MemoryEngine(MemoryEngineInterface):
                 else:
                     deleted = unit_id if fact_type is not None else None
                     if deleted:
-                        await _store.delete_facts(bank_id, [unit_id])
+                        # Tag the store tombstone so it commits atomically with this transaction.
+                        _del_txn = await _store.begin_txn(
+                            conn=conn, fq_table=fq_table, bank_id=bank_id, mutating=True
+                        )
+                        await _store.delete_facts(bank_id, [unit_id], txn=_del_txn)
 
                 # Invalidate observations referencing this (now-deleted) source memory
                 if bank_id and fact_type in ("experience", "world"):
@@ -6314,6 +6332,11 @@ class MemoryEngine(MemoryEngineInterface):
                     if deleted
                     else "Memory unit not found",
                 }
+
+        # Postgres committed: publish the store's tombstone write-group (no-op if nothing was
+        # deleted or the store keeps memories in SQL).
+        if _del_txn is not None:
+            await _store.decide_txn(_del_txn, commit=True)
 
         # Drop any cached stats for this bank — the deleted unit (and its
         # cascaded links/entities) changed the counts get_bank_stats reports,
@@ -6942,6 +6965,12 @@ class MemoryEngine(MemoryEngineInterface):
                 if record is None:
                     return None
                 found = True
+                # One cross-store write-group for this curation edit/invalidate/revert: the
+                # store's writes below (apply_edit + re-embed, or the archive move) are tagged so
+                # they commit together with this Postgres transaction; decided after it commits.
+                _curation_txn = await store.begin_txn(
+                    conn=conn, fq_table=fq_table, bank_id=bank_id, mutating=True
+                )
                 current_fact_type = record.fact_type
                 if current_fact_type not in ("experience", "world"):
                     raise ValueError(
@@ -7025,6 +7054,7 @@ class MemoryEngine(MemoryEngineInterface):
                         event_date=new_event_date,
                         mentioned_at=live.mentioned_at,
                         entity_ids=edit_entity_ids,
+                        txn=_curation_txn,
                     )
 
                     # Re-embed from the now-current fields + entity names (through the
@@ -7042,7 +7072,8 @@ class MemoryEngine(MemoryEngineInterface):
                     )
                     if new_emb is not None:
                         await store.set_memory_embedding(
-                            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid), embedding=new_emb
+                            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid),
+                            embedding=new_emb, txn=_curation_txn,
                         )
                     await self._delete_stale_observations_for_memories(conn, bank_id, [memory_id])
                     need_consolidation = True
@@ -7053,7 +7084,8 @@ class MemoryEngine(MemoryEngineInterface):
                     # Capture relink victims before the row (and its links) go.
                     await enqueue_relink_victims(conn, bank_id, [memory_id], ops=backend.ops)
                     await store.invalidate_memory(
-                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid), reason=reason
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid), reason=reason,
+                        txn=_curation_txn,
                     )
                     # Sweep after the move, so a racing observation insert is caught too.
                     await self._delete_stale_observations_for_memories(conn, bank_id, [memory_id])
@@ -7068,7 +7100,7 @@ class MemoryEngine(MemoryEngineInterface):
                 # --- Revert: move archive → live ---
                 elif state == "valid" and archived:
                     restored = await store.restore_memory(
-                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid)
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_id=str(memory_uuid), txn=_curation_txn
                     )
                     if restored is not None:
                         # Recompute the embedding — the archive need not keep one — from the
@@ -7093,12 +7125,17 @@ class MemoryEngine(MemoryEngineInterface):
                                 bank_id=bank_id,
                                 unit_id=str(memory_uuid),
                                 embedding=new_emb,
+                                txn=_curation_txn,
                             )
                     need_consolidation = True
                     need_graph = True
 
         if not found:
             return None
+
+        # Postgres committed the curation change: publish the store's write-group. On a crash
+        # before here the writes stay invisible and the recovery sweep resolves them (spec §5).
+        await store.decide_txn(_curation_txn, commit=True)
 
         if need_consolidation:
             config = await self._config_resolver.resolve_full_config(bank_id, request_context)
